@@ -1,0 +1,47 @@
+# /etc/systemd/system/tower-api.service
+#
+# Install:
+#   sudo cp tower-api.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable tower-api
+#   sudo systemctl start tower-api
+#
+# Logs:
+#   journalctl -u tower-api -f
+
+[Unit]
+Description=Tower Light REST API
+After=network.target dev-tower\x2dlight.device
+# Wait for the USB device to appear before starting
+Wants=dev-tower\x2dlight.device
+
+[Service]
+Type=simple
+User=robot
+Group=dialout
+
+ExecStart=/usr/local/bin/tower-api /dev/tower-light
+
+# ── Environment ───────────────────────────────────────────────────────────────
+Environment=RUST_LOG=tower_api=info
+Environment=TOWER_BIND=0.0.0.0:3000
+
+# ── Crash recovery ────────────────────────────────────────────────────────────
+# Restart on any failure (crash, OOM, non-zero exit)
+Restart=on-failure
+RestartSec=2s
+# But don't restart-loop forever: if it crashes 5 times in 60s, give up
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# ── Hardening (optional, remove if causing issues) ───────────────────────────
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+# Allow access to the serial device
+DeviceAllow=/dev/tower-light rw
+DeviceAllow=/dev/ttyUSB0 rw
+
+[Install]
+WantedBy=multi-user.target

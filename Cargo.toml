@@ -1,0 +1,37 @@
+[package]
+name = "tower-api"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "tower-api"
+path = "src/main.rs"
+
+[dependencies]
+# HTTP server
+axum = { version = "0.7", features = ["json"] }
+tokio = { version = "1", features = ["full"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["trace"] }
+
+# Serial port
+serialport = "4"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "1"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# OpenAPI / Swagger
+utoipa = { version = "4", features = ["axum_extras", "chrono"] }
+utoipa-swagger-ui = { version = "7", features = ["axum", "debug-embed"] }
