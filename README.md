@@ -18,6 +18,7 @@ sudo systemctl enable --now tower-api
 
 The API listens on **port 3000** by default.  
 Override with `TOWER_BIND=0.0.0.0:8080`.
+Swagger Docs is available at `http://localhost:3000/docs/`
 
 ---
 
