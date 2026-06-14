@@ -1,7 +1,7 @@
 # tower-api
 
 REST API for the Adafruit USB Tri-Color Tower Light with Buzzer.  
-Runs on the Jetson (or any Linux box). Starts with **yellow on** to signal boot.
+Runs on the Jetson (or any Linux box). Starts with **green on** to signal boot.
 
 ---
 
