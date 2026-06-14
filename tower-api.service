@@ -17,7 +17,7 @@ Wants=dev-tower\x2dlight.device
 
 [Service]
 Type=simple
-User=robot
+User=capra
 Group=dialout
 
 ExecStart=/usr/local/bin/tower-api /dev/tower-light
