@@ -33,7 +33,11 @@ use crate::AppState;
             - `green` — Green LED segment\n\
             - `buzzer` — Audible buzzer\n\n\
             ## Boot behavior\n\
-            On startup the service sets **yellow ON** to indicate the system is initializing."
+            On startup the service sets **yellow ON** to indicate the system is initializing.\n\n\
+            ## Hardware unavailable\n\
+            If the tower light is not connected, `GET /status` still works but all \
+            control endpoints return **503 Service Unavailable**. \
+            The device is re-detected automatically on the next request after being plugged in."
     ),
     paths(
         get_status,
@@ -52,6 +56,7 @@ use crate::AppState;
         LightState,
         ChannelState,
         Channel,
+        StatusResponse,
         ApiOk,
         SetAllBody,
         BlinkBody,
@@ -70,6 +75,16 @@ use crate::AppState;
 pub struct ApiDoc;
 
 // ── Response / request schemas ────────────────────────────────────────────────
+
+/// Full status response: connection state + per-channel light state
+#[derive(Serialize, ToSchema)]
+pub struct StatusResponse {
+    /// Whether the tower light hardware is currently connected
+    pub connected: bool,
+    /// Per-channel light state (reflects last known state even when disconnected)
+    #[serde(flatten)]
+    pub light: LightState,
+}
 
 /// Standard API response
 #[derive(Serialize, ToSchema)]
@@ -160,6 +175,60 @@ fn err(status: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<ApiOk>) 
     (status, Json(ApiOk { ok: false, message: Some(msg.into()) }))
 }
 
+/// Returns a 503 response when the tower light hardware is not connected.
+fn no_hw() -> (StatusCode, Json<ApiOk>) {
+    err(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Tower light not connected — device not found on USB",
+    )
+}
+
+/// Find the port for the tower light, respecting CLI override.
+fn resolve_port(s: &AppState) -> Option<String> {
+    if let Some(ref path) = s.port_override {
+        return Some(path.clone());
+    }
+    crate::hardware::find_device_port(s.vid, s.pid)
+}
+
+/// Check if the tower light is present on USB by enumerating ports.
+/// Accurate even immediately after plug/unplug — no filesystem tricks needed.
+fn device_present(s: &AppState) -> bool {
+    let port = resolve_port(s);
+    tracing::info!("device_present: {:?}", port);
+    port.is_some()
+}
+
+/// Ensure hardware is open and ready. If the hw slot is None, tries to find
+/// and open the device. If the device has been unplugged, clears the slot.
+/// Returns true if hardware is available after this call.
+async fn ensure_connected(s: &AppState) -> bool {
+    let mut hw = s.hw.lock().await;
+
+    // If we have an open handle, verify the device is still on USB.
+    if hw.is_some() {
+        if device_present(s) {
+            return true;
+        }
+        // Device was unplugged — clear the handle.
+        *hw = None;
+        return false;
+    }
+
+    // No handle — try to find and open the device.
+    let Some(port) = resolve_port(s) else {
+        return false;
+    };
+    match crate::hardware::TowerHardware::open(&port) {
+        Ok(dev) => {
+            tracing::info!("Tower light connected on {port}");
+            *hw = Some(dev);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 fn parse_channel(s: &str) -> Option<Channel> {
     match s.to_lowercase().as_str() {
         "red"    => Some(Channel::Red),
@@ -203,18 +272,29 @@ pub fn build_router(state: AppState) -> Router {
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
-/// Get current state of all channels
+/// Get current state of all channels and whether the hardware is connected.
+/// Always succeeds, even when the tower light is not connected.
 #[utoipa::path(
     get,
     path = "/status",
     tag = "status",
     responses(
-        (status = 200, description = "Current light state", body = LightState)
+        (status = 200, description = "Current light state and connection status", body = StatusResponse)
     )
 )]
 async fn get_status(State(s): State<AppState>) -> impl IntoResponse {
-    let light = s.light.lock().await;
-    (StatusCode::OK, Json(light.clone()))
+    // Enumerate USB ports to get a live, accurate connection status.
+    // This works immediately on plug/unplug without needing any I/O on the port.
+    let connected = device_present(&s);
+
+    // If we have an open handle but the device is gone, clear it so the next
+    // control request will re-open cleanly.
+    if !connected {
+        *s.hw.lock().await = None;
+    }
+
+    let light = s.light.lock().await.clone();
+    (StatusCode::OK, Json(StatusResponse { connected, light }))
 }
 
 /// Turn all channels off and cancel all blink tasks
@@ -223,52 +303,64 @@ async fn get_status(State(s): State<AppState>) -> impl IntoResponse {
     path = "/clear",
     tag = "global",
     responses(
-        (status = 200, description = "All channels cleared", body = ApiOk),
-        (status = 500, description = "Hardware error",       body = ApiOk),
+        (status = 200, description = "All channels cleared",        body = ApiOk),
+        (status = 500, description = "Hardware error",              body = ApiOk),
+        (status = 503, description = "Tower light not connected",   body = ApiOk),
     )
 )]
 async fn post_clear(State(s): State<AppState>) -> impl IntoResponse {
+    if !ensure_connected(&s).await {
+        return no_hw();
+    }
     s.blinker.cancel_all().await;
     let mut hw = s.hw.lock().await;
-    match hw.all_off() {
+    match hw.as_mut().unwrap().all_off() {
         Ok(_) => {
             let mut l = s.light.lock().await;
             l.clear();
             info!("ALL OFF");
             ok("All channels cleared")
         }
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => {
+            *hw = None;
+            err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        }
     }
 }
 
-/// Set multiple channels on/off in a single atomic request
+/// Set multiple channels atomically
 #[utoipa::path(
     post,
     path = "/set",
     tag = "global",
     request_body = SetAllBody,
     responses(
-        (status = 200, description = "Channels updated", body = ApiOk),
-        (status = 500, description = "Hardware error",   body = ApiOk),
+        (status = 200, description = "Channels updated",            body = ApiOk),
+        (status = 500, description = "Hardware error",              body = ApiOk),
+        (status = 503, description = "Tower light not connected",   body = ApiOk),
     )
 )]
 async fn post_set_all(
     State(s): State<AppState>,
     Json(body): Json<SetAllBody>,
 ) -> impl IntoResponse {
-    let pairs: [(Option<bool>, Channel); 4] = [
+    if !ensure_connected(&s).await {
+        return no_hw();
+    }
+    let channels: &[(Option<bool>, Channel)] = &[
         (body.red,    Channel::Red),
         (body.yellow, Channel::Yellow),
         (body.green,  Channel::Green),
         (body.buzzer, Channel::Buzzer),
     ];
-    for (val, ch) in pairs {
-        let Some(on) = val else { continue };
+    for &(maybe_on, ch) in channels {
+        let Some(on) = maybe_on else { continue };
         let (on_cmd, off_cmd, _) = hw_on_off_blink(ch);
         s.blinker.cancel(ch).await;
         let mut hw = s.hw.lock().await;
         let cmd = if on { on_cmd } else { off_cmd };
-        if let Err(e) = hw.send(cmd) {
+        if let Err(e) = hw.as_mut().unwrap().send(cmd) {
+            *hw = None;
             return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
         }
         let mut l = s.light.lock().await;
@@ -284,9 +376,10 @@ async fn post_set_all(
     tag = "channel",
     params(("channel" = String, Path, description = "red | yellow | green | buzzer")),
     responses(
-        (status = 200, description = "Channel turned on",    body = ApiOk),
-        (status = 404, description = "Unknown channel",      body = ApiOk),
-        (status = 500, description = "Hardware error",       body = ApiOk),
+        (status = 200, description = "Channel turned on",           body = ApiOk),
+        (status = 404, description = "Unknown channel",             body = ApiOk),
+        (status = 500, description = "Hardware error",              body = ApiOk),
+        (status = 503, description = "Tower light not connected",   body = ApiOk),
     )
 )]
 async fn post_on(
@@ -296,17 +389,23 @@ async fn post_on(
     let Some(ch) = parse_channel(&channel) else {
         return err(StatusCode::NOT_FOUND, format!("Unknown channel: {channel}"));
     };
+    if !ensure_connected(&s).await {
+        return no_hw();
+    }
     let (on_cmd, _, _) = hw_on_off_blink(ch);
     s.blinker.cancel(ch).await;
     let mut hw = s.hw.lock().await;
-    match hw.send(on_cmd) {
+    match hw.as_mut().unwrap().send(on_cmd) {
         Ok(_) => {
             let mut l = s.light.lock().await;
             l.set_channel(ch, ChannelState::On);
             info!("{ch} ON");
             ok(format!("{ch} on"))
         }
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => {
+            *hw = None;
+            err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        }
     }
 }
 
@@ -317,9 +416,10 @@ async fn post_on(
     tag = "channel",
     params(("channel" = String, Path, description = "red | yellow | green | buzzer")),
     responses(
-        (status = 200, description = "Channel turned off", body = ApiOk),
-        (status = 404, description = "Unknown channel",    body = ApiOk),
-        (status = 500, description = "Hardware error",     body = ApiOk),
+        (status = 200, description = "Channel turned off",          body = ApiOk),
+        (status = 404, description = "Unknown channel",             body = ApiOk),
+        (status = 500, description = "Hardware error",              body = ApiOk),
+        (status = 503, description = "Tower light not connected",   body = ApiOk),
     )
 )]
 async fn post_off(
@@ -336,9 +436,10 @@ async fn post_off(
     tag = "channel",
     params(("channel" = String, Path, description = "red | yellow | green | buzzer")),
     responses(
-        (status = 200, description = "Channel turned off", body = ApiOk),
-        (status = 404, description = "Unknown channel",    body = ApiOk),
-        (status = 500, description = "Hardware error",     body = ApiOk),
+        (status = 200, description = "Channel turned off",          body = ApiOk),
+        (status = 404, description = "Unknown channel",             body = ApiOk),
+        (status = 500, description = "Hardware error",              body = ApiOk),
+        (status = 503, description = "Tower light not connected",   body = ApiOk),
     )
 )]
 async fn delete_channel(
@@ -352,17 +453,23 @@ async fn channel_off(s: AppState, channel: String) -> impl IntoResponse {
     let Some(ch) = parse_channel(&channel) else {
         return err(StatusCode::NOT_FOUND, format!("Unknown channel: {channel}"));
     };
+    if !ensure_connected(&s).await {
+        return no_hw();
+    }
     let (_, off_cmd, _) = hw_on_off_blink(ch);
     s.blinker.cancel(ch).await;
     let mut hw = s.hw.lock().await;
-    match hw.send(off_cmd) {
+    match hw.as_mut().unwrap().send(off_cmd) {
         Ok(_) => {
             let mut l = s.light.lock().await;
             l.set_channel(ch, ChannelState::Off);
             info!("{ch} OFF");
             ok(format!("{ch} off"))
         }
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => {
+            *hw = None;
+            err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        }
     }
 }
 
@@ -373,9 +480,10 @@ async fn channel_off(s: AppState, channel: String) -> impl IntoResponse {
     tag = "channel",
     params(("channel" = String, Path, description = "red | yellow | green | buzzer")),
     responses(
-        (status = 200, description = "Hardware blink started", body = ApiOk),
-        (status = 404, description = "Unknown channel",        body = ApiOk),
-        (status = 500, description = "Hardware error",         body = ApiOk),
+        (status = 200, description = "Hardware blink started",      body = ApiOk),
+        (status = 404, description = "Unknown channel",             body = ApiOk),
+        (status = 500, description = "Hardware error",              body = ApiOk),
+        (status = 503, description = "Tower light not connected",   body = ApiOk),
     )
 )]
 async fn post_hw_blink(
@@ -385,17 +493,23 @@ async fn post_hw_blink(
     let Some(ch) = parse_channel(&channel) else {
         return err(StatusCode::NOT_FOUND, format!("Unknown channel: {channel}"));
     };
+    if !ensure_connected(&s).await {
+        return no_hw();
+    }
     let (_, _, blink_cmd) = hw_on_off_blink(ch);
     s.blinker.cancel(ch).await;
     let mut hw = s.hw.lock().await;
-    match hw.send(blink_cmd) {
+    match hw.as_mut().unwrap().send(blink_cmd) {
         Ok(_) => {
             let mut l = s.light.lock().await;
             l.set_channel(ch, ChannelState::HwBlink);
             info!("{ch} HW_BLINK");
             ok(format!("{ch} hardware blink"))
         }
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => {
+            *hw = None;
+            err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        }
     }
 }
 
@@ -407,8 +521,9 @@ async fn post_hw_blink(
     params(("channel" = String, Path, description = "red | yellow | green | buzzer")),
     request_body = BlinkBody,
     responses(
-        (status = 200, description = "Blink started", body = ApiOk),
-        (status = 404, description = "Unknown channel", body = ApiOk),
+        (status = 200, description = "Blink started",               body = ApiOk),
+        (status = 404, description = "Unknown channel",             body = ApiOk),
+        (status = 503, description = "Tower light not connected",   body = ApiOk),
     )
 )]
 async fn post_sw_blink(
@@ -419,6 +534,9 @@ async fn post_sw_blink(
     let Some(ch) = parse_channel(&channel) else {
         return err(StatusCode::NOT_FOUND, format!("Unknown channel: {channel}"));
     };
+    if !ensure_connected(&s).await {
+        return no_hw();
+    }
     s.blinker.cancel(ch).await;
     s.blinker.start_sw_blink(ch, body.on_ms, body.off_ms).await;
     info!("{ch} SW_BLINK on={}ms off={}ms", body.on_ms, body.off_ms);
@@ -433,8 +551,9 @@ async fn post_sw_blink(
     params(("channel" = String, Path, description = "red | yellow | green | buzzer")),
     request_body = PulseBody,
     responses(
-        (status = 200, description = "Pulse started", body = ApiOk),
-        (status = 404, description = "Unknown channel", body = ApiOk),
+        (status = 200, description = "Pulse started",               body = ApiOk),
+        (status = 404, description = "Unknown channel",             body = ApiOk),
+        (status = 503, description = "Tower light not connected",   body = ApiOk),
     )
 )]
 async fn post_pulse(
@@ -445,6 +564,9 @@ async fn post_pulse(
     let Some(ch) = parse_channel(&channel) else {
         return err(StatusCode::NOT_FOUND, format!("Unknown channel: {channel}"));
     };
+    if !ensure_connected(&s).await {
+        return no_hw();
+    }
     s.blinker.cancel(ch).await;
     s.blinker.start_pulse(ch, body.on_ms, body.off_ms, body.count).await;
     info!("{ch} PULSE {}x ({}ms/{}ms)", body.count, body.on_ms, body.off_ms);
@@ -459,8 +581,9 @@ async fn post_pulse(
     params(("channel" = String, Path, description = "red | yellow | green | buzzer")),
     request_body = TimedBody,
     responses(
-        (status = 200, description = "Timed on started", body = ApiOk),
-        (status = 404, description = "Unknown channel",  body = ApiOk),
+        (status = 200, description = "Timed on started",            body = ApiOk),
+        (status = 404, description = "Unknown channel",             body = ApiOk),
+        (status = 503, description = "Tower light not connected",   body = ApiOk),
     )
 )]
 async fn post_timed(
@@ -471,6 +594,9 @@ async fn post_timed(
     let Some(ch) = parse_channel(&channel) else {
         return err(StatusCode::NOT_FOUND, format!("Unknown channel: {channel}"));
     };
+    if !ensure_connected(&s).await {
+        return no_hw();
+    }
     s.blinker.cancel(ch).await;
     s.blinker.start_timed(ch, body.duration_ms).await;
     info!("{ch} TIMED {}ms", body.duration_ms);
@@ -485,9 +611,10 @@ async fn post_timed(
     params(("channel" = String, Path, description = "red | yellow | green | buzzer")),
     request_body = SequenceBody,
     responses(
-        (status = 200, description = "Sequence started",    body = ApiOk),
-        (status = 400, description = "Empty steps list",    body = ApiOk),
-        (status = 404, description = "Unknown channel",     body = ApiOk),
+        (status = 200, description = "Sequence started",            body = ApiOk),
+        (status = 400, description = "Empty steps list",            body = ApiOk),
+        (status = 404, description = "Unknown channel",             body = ApiOk),
+        (status = 503, description = "Tower light not connected",   body = ApiOk),
     )
 )]
 async fn post_sequence(
@@ -498,6 +625,9 @@ async fn post_sequence(
     let Some(ch) = parse_channel(&channel) else {
         return err(StatusCode::NOT_FOUND, format!("Unknown channel: {channel}"));
     };
+    if !ensure_connected(&s).await {
+        return no_hw();
+    }
     if body.steps.is_empty() {
         return err(StatusCode::BAD_REQUEST, "steps cannot be empty");
     }

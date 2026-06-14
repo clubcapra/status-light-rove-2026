@@ -31,8 +31,12 @@ impl Drop for ChannelTask {
 /// Manages software-driven blink tasks for each channel independently.
 /// Each channel gets at most one running task at a time; starting a new one
 /// automatically cancels the previous.
+///
+/// When hardware is `None` the engine still tracks state but silently skips
+/// all serial writes — the routes layer is responsible for rejecting requests
+/// before they reach the engine.
 pub struct BlinkEngine {
-    hw:    Arc<Mutex<TowerHardware>>,
+    hw:    Arc<Mutex<Option<TowerHardware>>>,
     light: Arc<Mutex<LightState>>,
     tasks: Mutex<[Option<ChannelTask>; 4]>,
 }
@@ -55,8 +59,18 @@ fn hw_on_off(ch: Channel) -> (u8, u8) {
     }
 }
 
+/// Send a command to hardware if it is present, silently skip if not.
+async fn try_send(hw: &Arc<Mutex<Option<TowerHardware>>>, cmd: u8) {
+    let mut lock = hw.lock().await;
+    if let Some(ref mut dev) = *lock {
+        if let Err(e) = dev.send(cmd) {
+            warn!("blink engine hw error: {e}");
+        }
+    }
+}
+
 impl BlinkEngine {
-    pub fn new(hw: Arc<Mutex<TowerHardware>>, light: Arc<Mutex<LightState>>) -> Self {
+    pub fn new(hw: Arc<Mutex<Option<TowerHardware>>>, light: Arc<Mutex<LightState>>) -> Self {
         Self {
             hw,
             light,
@@ -86,22 +100,9 @@ impl BlinkEngine {
 
         let handle = tokio::spawn(async move {
             loop {
-                // ON phase
-                {
-                    let mut hw_lock = hw.lock().await;
-                    if let Err(e) = hw_lock.send(on_cmd) {
-                        warn!("blink engine hw error: {e}");
-                    }
-                }
+                try_send(&hw, on_cmd).await;
                 sleep(Duration::from_millis(on_ms)).await;
-
-                // OFF phase
-                {
-                    let mut hw_lock = hw.lock().await;
-                    if let Err(e) = hw_lock.send(off_cmd) {
-                        warn!("blink engine hw error: {e}");
-                    }
-                }
+                try_send(&hw, off_cmd).await;
                 sleep(Duration::from_millis(off_ms)).await;
             }
         });
@@ -109,7 +110,6 @@ impl BlinkEngine {
         let mut tasks = self.tasks.lock().await;
         tasks[channel_index(ch)] = Some(ChannelTask { handle });
 
-        // Update state machine
         let mut l = light.lock().await;
         l.set_channel(ch, ChannelState::SwBlink { on_ms, off_ms });
     }
@@ -124,20 +124,13 @@ impl BlinkEngine {
         let handle = tokio::spawn(async move {
             for i in 0..count {
                 debug!("pulse {ch} {}/{count}", i + 1);
-                {
-                    let mut hw_lock = hw.lock().await;
-                    let _ = hw_lock.send(on_cmd);
-                }
+                try_send(&hw, on_cmd).await;
                 sleep(Duration::from_millis(on_ms)).await;
-                {
-                    let mut hw_lock = hw.lock().await;
-                    let _ = hw_lock.send(off_cmd);
-                }
+                try_send(&hw, off_cmd).await;
                 if i < count - 1 {
                     sleep(Duration::from_millis(off_ms)).await;
                 }
             }
-            // Update state machine to Off when done
             let mut l = light.lock().await;
             l.set_channel(ch, ChannelState::Off);
         });
@@ -157,15 +150,9 @@ impl BlinkEngine {
         let (on_cmd, off_cmd) = hw_on_off(ch);
 
         let handle = tokio::spawn(async move {
-            {
-                let mut hw_lock = hw.lock().await;
-                let _ = hw_lock.send(on_cmd);
-            }
+            try_send(&hw, on_cmd).await;
             sleep(Duration::from_millis(duration_ms)).await;
-            {
-                let mut hw_lock = hw.lock().await;
-                let _ = hw_lock.send(off_cmd);
-            }
+            try_send(&hw, off_cmd).await;
             let mut l = light.lock().await;
             l.set_channel(ch, ChannelState::Off);
         });
@@ -187,9 +174,9 @@ impl BlinkEngine {
 
         let handle = tokio::spawn(async move {
             for (on_ms, off_ms) in steps {
-                { let mut hw_lock = hw.lock().await; let _ = hw_lock.send(on_cmd); }
+                try_send(&hw, on_cmd).await;
                 sleep(Duration::from_millis(on_ms)).await;
-                { let mut hw_lock = hw.lock().await; let _ = hw_lock.send(off_cmd); }
+                try_send(&hw, off_cmd).await;
                 if off_ms > 0 {
                     sleep(Duration::from_millis(off_ms)).await;
                 }

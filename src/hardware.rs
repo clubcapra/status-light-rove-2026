@@ -21,6 +21,26 @@ pub const HW_BUZZER_ON:    u8 = 0x18;
 pub const HW_BUZZER_OFF:   u8 = 0x28;
 pub const HW_BUZZER_BLINK: u8 = 0x48;
 
+/// CH340 USB VID/PID used by the Adafruit tower light.
+pub const TOWER_VID: u16 = 0x1a86;
+pub const TOWER_PID: u16 = 0x7523;
+
+// ── USB enumeration ───────────────────────────────────────────────────────────
+
+/// Scan available serial ports and return the path of the first one that
+/// matches the given VID/PID. Returns None if no matching device is found.
+pub fn find_device_port(vid: u16, pid: u16) -> Option<String> {
+    let ports = serialport::available_ports().ok()?;
+    for p in &ports {
+        if let serialport::SerialPortType::UsbPort(usb) = &p.port_type {
+            if usb.vid == vid && usb.pid == pid {
+                return Some(p.port_name.clone());
+            }
+        }
+    }
+    None
+}
+
 // ── TowerHardware ─────────────────────────────────────────────────────────────
 
 pub struct TowerHardware {
@@ -30,22 +50,19 @@ pub struct TowerHardware {
 
 impl TowerHardware {
     pub fn open(path: &str) -> Result<Self> {
-        let port = Self::open_port(path)?;
+        let port = serialport::new(path, 9600)
+            .timeout(Duration::from_millis(200))
+            .open()
+            .with_context(|| format!("Failed to open serial port {path}"))?;
         Ok(Self {
             port,
             port_path: path.to_string(),
         })
     }
 
-    fn open_port(path: &str) -> Result<Box<dyn SerialPort>> {
-        serialport::new(path, 9600)
-            .timeout(Duration::from_millis(200))
-            .open()
-            .with_context(|| format!("Failed to open serial port {path}"))
-    }
-
     /// Send a single command byte to the hardware.
     /// On failure, attempt one reconnect then retry.
+    /// Returns Err if the device is truly gone after the reconnect attempt.
     pub fn send(&mut self, cmd: u8) -> Result<()> {
         if let Err(e) = self.port.write_all(&[cmd]) {
             warn!("Serial write failed ({e}), attempting reconnect...");
@@ -66,9 +83,11 @@ impl TowerHardware {
 
     /// Attempt to reopen the serial port (called after a write error).
     fn reconnect(&mut self) -> Result<()> {
-        // Give the OS a moment to re-enumerate if it was a transient glitch
         std::thread::sleep(Duration::from_millis(500));
-        match Self::open_port(&self.port_path) {
+        match serialport::new(&self.port_path, 9600)
+            .timeout(Duration::from_millis(200))
+            .open()
+        {
             Ok(p) => {
                 self.port = p;
                 info!("Reconnected to {}", self.port_path);
@@ -76,7 +95,7 @@ impl TowerHardware {
             }
             Err(e) => {
                 error!("Reconnect failed: {e}");
-                Err(e)
+                Err(anyhow::anyhow!(e))
             }
         }
     }

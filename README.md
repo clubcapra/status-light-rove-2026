@@ -27,6 +27,12 @@ sudo systemctl enable --now tower-api
 ```
 
 You may need to change the `tower-api.service` line for `User=capra` and replace 'capra' with your actual user
+or you can just start the service locally with:
+
+```bash
+tmux new -s tower-api
+tower-api /dev/tower-light
+```
 
 `tower-api` is installed as a **system** service (runs as `capra`, enabled on
 boot). Manage / inspect it with:

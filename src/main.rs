@@ -5,56 +5,37 @@ mod blink_engine;
 
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::{info, error};
 use anyhow::Result;
 
-use hardware::TowerHardware;
+use hardware::{TowerHardware, find_device_port, TOWER_VID, TOWER_PID};
 use state::LightState;
 use blink_engine::BlinkEngine;
-
-// ── USB autodetection ────────────────────────────────────────────────────────
-
-/// Walk available serial ports and return the first one that looks like the
-/// CH340 tower light (vendor 0x1a86, product 0x7523).
-fn autodetect_port() -> Option<String> {
-    let ports = serialport::available_ports().ok()?;
-    for p in &ports {
-        if let serialport::SerialPortType::UsbPort(usb) = &p.port_type {
-            // QinHeng CH340 — the chip used by the Adafruit tower light
-            if usb.vid == 0x1a86 && usb.pid == 0x7523 {
-                info!("Autodetected tower light on {}", p.port_name);
-                return Some(p.port_name.clone());
-            }
-        }
-    }
-    // Fallback: if exactly one USB serial port exists, assume it's ours
-    let usb_ports: Vec<_> = ports
-        .iter()
-        .filter(|p| matches!(p.port_type, serialport::SerialPortType::UsbPort(_)))
-        .collect();
-    if usb_ports.len() == 1 {
-        warn!(
-            "No CH340 match; falling back to only USB serial port: {}",
-            usb_ports[0].port_name
-        );
-        return Some(usb_ports[0].port_name.clone());
-    }
-    None
-}
 
 // ── Shared application state ─────────────────────────────────────────────────
 
 #[derive(Clone)]
 pub struct AppState {
-    pub hw:     Arc<Mutex<TowerHardware>>,
-    pub light:  Arc<Mutex<LightState>>,
+    /// None when the hardware device is not connected / failed to open.
+    pub hw:      Arc<Mutex<Option<TowerHardware>>>,
+    pub light:   Arc<Mutex<LightState>>,
     pub blinker: Arc<BlinkEngine>,
+    /// USB VID/PID used to find the device on enumeration.
+    pub vid:     u16,
+    pub pid:     u16,
+    /// Optional CLI-override port path. When set, skip VID/PID enumeration
+    /// and always try this path directly.
+    pub port_override: Option<String>,
 }
 
 // ── Main ─────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() -> Result<()> {
+
+    for p in serialport::available_ports().unwrap_or_default() {
+        eprintln!("{:?}", p);
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             std::env::var("RUST_LOG")
@@ -62,42 +43,75 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    // Port resolution: CLI arg → autodetect → udev symlink fallback
-    let port_path = std::env::args()
-        .nth(1)
-        .or_else(autodetect_port)
-        .unwrap_or_else(|| {
-            warn!("Could not autodetect port; trying /dev/tower-light (udev symlink)");
-            "/dev/tower-light".to_string()
-        });
+    // If a port path is given on the CLI, use it directly instead of
+    // enumerating by VID/PID. This covers non-CH340 adapters or fixed paths.
+    let port_override = std::env::args().nth(1);
 
-    info!("Opening serial port: {}", port_path);
+    // Try to open hardware on startup — failure is non-fatal, API still starts.
+    let initial_port = port_override.clone()
+        .or_else(|| find_device_port(TOWER_VID, TOWER_PID));
 
-    let hw = TowerHardware::open(&port_path)?;
+    let hw_device = match initial_port {
+        None => {
+            error!(
+                "Tower light not found on USB (VID={:#06x} PID={:#06x}).\n\
+                 API will start without hardware — all control endpoints \
+                 will return 503 until the device is plugged in.",
+                TOWER_VID, TOWER_PID
+            );
+            None
+        }
+        Some(ref path) => match TowerHardware::open(path) {
+            Ok(hw) => {
+                info!("Tower light connected on {path}");
+                Some(hw)
+            }
+            Err(e) => {
+                error!("Found device at {path} but failed to open it: {e}");
+                None
+            }
+        },
+    };
+
     let light = LightState::default();
-
-    let hw    = Arc::new(Mutex::new(hw));
+    let hw    = Arc::new(Mutex::new(hw_device));
     let light = Arc::new(Mutex::new(light));
 
-    // Boot sequence: clear any stale state, then set yellow to signal "starting up"
+    // Boot sequence: only run if hardware is present.
     {
-        let mut hw_lock    = hw.lock().await;
-        let mut light_lock = light.lock().await;
-        hw_lock.all_off()?;
-        light_lock.clear();
-        hw_lock.send(hardware::HW_YELLOW_ON)?;
-        light_lock.yellow = state::ChannelState::On;
-        info!("Boot state: YELLOW ON");
+        let mut hw_lock = hw.lock().await;
+        if let Some(ref mut hw_dev) = *hw_lock {
+            let mut light_lock = light.lock().await;
+            if let Err(e) = hw_dev.all_off() {
+                error!("Boot all_off failed: {e}");
+            }
+            light_lock.clear();
+            if let Err(e) = hw_dev.send(hardware::HW_YELLOW_ON) {
+                error!("Boot yellow_on failed: {e}");
+            }
+            light_lock.yellow = state::ChannelState::On;
+            info!("Boot state: YELLOW ON");
+        } else {
+            info!("Boot state: no hardware, skipping boot sequence");
+        }
     }
 
     let blinker = Arc::new(BlinkEngine::new(Arc::clone(&hw), Arc::clone(&light)));
 
-    let app_state = AppState { hw, light, blinker };
+    let app_state = AppState {
+        hw,
+        light,
+        blinker,
+        vid: TOWER_VID,
+        pid: TOWER_PID,
+        port_override,
+    };
 
     let router = routes::build_router(app_state);
 
     let bind = std::env::var("TOWER_BIND").unwrap_or_else(|_| "0.0.0.0:3000".into());
     info!("Tower light API listening on http://{}", bind);
+    eprintln!("✔ Tower light API ready → http://{}/docs/", bind);
 
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     axum::serve(listener, router).await?;
