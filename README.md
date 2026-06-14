@@ -7,16 +7,35 @@ Runs on the Jetson (or any Linux box). Starts with **yellow on** to signal boot.
 
 ## Quick start
 
+Run the install script as a normal user (it uses `sudo` where needed). It builds
+the binary, installs it, installs the udev rule + systemd service, and enables the
+service to start on boot:
+
+```bash
+./scripts/update_scripts.sh
+```
+
+Or do the steps manually:
+
 ```bash
 cargo build --release
 sudo cp target/release/tower-api /usr/local/bin/
-sudo cp 99-tower-light.rules /etc/udev/rules.d/
+sudo cp scripts/99-tower-light.rules /etc/udev/rules.d/
 sudo udevadm control --reload-rules && sudo udevadm trigger
-sudo cp tower-api.service /etc/systemd/system/
+sudo cp scripts/tower-api.service /etc/systemd/system/
 sudo systemctl enable --now tower-api
 ```
 
-You may need to change the `tower-api.service` line for `USER=capra` and replace 'capra' with your actual user
+You may need to change the `tower-api.service` line for `User=capra` and replace 'capra' with your actual user
+
+`tower-api` is installed as a **system** service (runs as `capra`, enabled on
+boot). Manage / inspect it with:
+
+```bash
+sudo systemctl status tower-api
+sudo systemctl restart tower-api
+journalctl -u tower-api -f
+```
 
 The API listens on **port 3000** by default.  
 Override with `TOWER_BIND=0.0.0.0:8080`.
