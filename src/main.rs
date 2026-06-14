@@ -86,11 +86,11 @@ async fn main() -> Result<()> {
                 error!("Boot all_off failed: {e}");
             }
             light_lock.clear();
-            if let Err(e) = hw_dev.send(hardware::HW_YELLOW_ON) {
-                error!("Boot yellow_on failed: {e}");
+            if let Err(e) = hw_dev.send(hardware::HW_GREEN_ON) {
+                error!("Boot green_on failed: {e}");
             }
-            light_lock.yellow = state::ChannelState::On;
-            info!("Boot state: YELLOW ON");
+            light_lock.green = state::ChannelState::On;
+            info!("Boot state: GREEN ON");
         } else {
             info!("Boot state: no hardware, skipping boot sequence");
         }
