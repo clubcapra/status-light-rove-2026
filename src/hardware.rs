@@ -5,21 +5,22 @@ use tracing::{info, warn, error};
 
 // ── Hardware byte constants ───────────────────────────────────────────────────
 
-pub const HW_RED_ON:       u8 = 0x11;
-pub const HW_RED_OFF:      u8 = 0x21;
-pub const HW_RED_BLINK:    u8 = 0x41;
+pub const HW_RED_ON:        u8 = 0x11;
+pub const HW_RED_OFF:       u8 = 0x21;
+pub const HW_RED_BLINK:     u8 = 0x41;
 
-pub const HW_YELLOW_ON:    u8 = 0x12;
-pub const HW_YELLOW_OFF:   u8 = 0x22;
-pub const HW_YELLOW_BLINK: u8 = 0x42;
+// The physical middle segment is orange, not yellow.
+pub const HW_ORANGE_ON:     u8 = 0x12;
+pub const HW_ORANGE_OFF:    u8 = 0x22;
+pub const HW_ORANGE_BLINK:  u8 = 0x42;
 
-pub const HW_GREEN_ON:     u8 = 0x14;
-pub const HW_GREEN_OFF:    u8 = 0x24;
-pub const HW_GREEN_BLINK:  u8 = 0x44;
+pub const HW_GREEN_ON:      u8 = 0x14;
+pub const HW_GREEN_OFF:     u8 = 0x24;
+pub const HW_GREEN_BLINK:   u8 = 0x44;
 
-pub const HW_BUZZER_ON:    u8 = 0x18;
-pub const HW_BUZZER_OFF:   u8 = 0x28;
-pub const HW_BUZZER_BLINK: u8 = 0x48;
+pub const HW_BUZZER_ON:     u8 = 0x18;
+pub const HW_BUZZER_OFF:    u8 = 0x28;
+pub const HW_BUZZER_BLINK:  u8 = 0x48;
 
 /// CH340 USB VID/PID used by the Adafruit tower light.
 pub const TOWER_VID: u16 = 0x1a86;
@@ -75,7 +76,7 @@ impl TowerHardware {
 
     /// Send all-off commands for every channel.
     pub fn all_off(&mut self) -> Result<()> {
-        for cmd in [HW_RED_OFF, HW_YELLOW_OFF, HW_GREEN_OFF, HW_BUZZER_OFF] {
+        for cmd in [HW_RED_OFF, HW_ORANGE_OFF, HW_GREEN_OFF, HW_BUZZER_OFF] {
             self.send(cmd)?;
         }
         Ok(())

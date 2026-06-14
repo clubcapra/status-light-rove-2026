@@ -12,7 +12,7 @@ use utoipa_swagger_ui::SwaggerUi;
 
 use crate::hardware::{
     HW_RED_ON,    HW_RED_OFF,    HW_RED_BLINK,
-    HW_YELLOW_ON, HW_YELLOW_OFF, HW_YELLOW_BLINK,
+    HW_ORANGE_ON, HW_ORANGE_OFF, HW_ORANGE_BLINK,
     HW_GREEN_ON,  HW_GREEN_OFF,  HW_GREEN_BLINK,
     HW_BUZZER_ON, HW_BUZZER_OFF, HW_BUZZER_BLINK,
 };
@@ -27,13 +27,17 @@ use crate::AppState;
         title = "Tower Light API",
         version = "0.1.0",
         description = "REST API for the Adafruit USB Tri-Color Tower Light with Buzzer.\n\n\
-            ## Channels\n\
+            ## Physical channels\n\
             - `red` — Red LED segment\n\
-            - `yellow` — Yellow LED segment\n\
+            - `orange` — Orange LED segment (the physical middle segment)\n\
             - `green` — Green LED segment\n\
             - `buzzer` — Audible buzzer\n\n\
+            ## Virtual channel\n\
+            - `yellow` — Turns red + orange + green on simultaneously, \
+            producing a yellow colour. `POST /yellow/off` turns all three off \
+            only if yellow mode was active.\n\n\
             ## Boot behavior\n\
-            On startup the service sets **yellow ON** to indicate the system is initializing.\n\n\
+            On startup the service sets **green ON** to indicate ready.\n\n\
             ## Hardware unavailable\n\
             If the tower light is not connected, `GET /status` still works but all \
             control endpoints return **503 Service Unavailable**. \
@@ -51,6 +55,8 @@ use crate::AppState;
         post_pulse,
         post_timed,
         post_sequence,
+        post_yellow_on,
+        post_yellow_off,
     ),
     components(schemas(
         LightState,
@@ -69,6 +75,7 @@ use crate::AppState;
         (name = "status",   description = "Read current light state"),
         (name = "global",   description = "Multi-channel or reset operations"),
         (name = "channel",  description = "Per-channel control"),
+        (name = "yellow",   description = "Virtual yellow channel (red + orange + green)"),
         (name = "advanced", description = "Timed, pulsed, and sequenced effects"),
     )
 )]
@@ -99,8 +106,8 @@ pub struct ApiOk {
 pub struct SetAllBody {
     /// Turn red LED on (true) or off (false)
     pub red:    Option<bool>,
-    /// Turn yellow LED on (true) or off (false)
-    pub yellow: Option<bool>,
+    /// Turn orange LED on (true) or off (false)
+    pub orange: Option<bool>,
     /// Turn green LED on (true) or off (false)
     pub green:  Option<bool>,
     /// Turn buzzer on (true) or off (false)
@@ -110,11 +117,9 @@ pub struct SetAllBody {
 /// Software blink parameters
 #[derive(Deserialize, ToSchema)]
 pub struct BlinkBody {
-    /// ON duration in milliseconds
     #[serde(default = "default_500")]
     #[schema(example = 500)]
     pub on_ms: u64,
-    /// OFF duration in milliseconds
     #[serde(default = "default_500")]
     #[schema(example = 500)]
     pub off_ms: u64,
@@ -123,14 +128,11 @@ pub struct BlinkBody {
 /// Pulse (blink N times then off) parameters
 #[derive(Deserialize, ToSchema)]
 pub struct PulseBody {
-    /// Number of times to blink
     #[schema(example = 3)]
     pub count: u32,
-    /// ON duration in milliseconds
     #[serde(default = "default_200")]
     #[schema(example = 200)]
     pub on_ms: u64,
-    /// OFF duration in milliseconds
     #[serde(default = "default_200")]
     #[schema(example = 200)]
     pub off_ms: u64,
@@ -139,7 +141,6 @@ pub struct PulseBody {
 /// Timed on parameters
 #[derive(Deserialize, ToSchema)]
 pub struct TimedBody {
-    /// How long to stay on in milliseconds, then auto-off
     #[schema(example = 2000)]
     pub duration_ms: u64,
 }
@@ -147,10 +148,8 @@ pub struct TimedBody {
 /// One step in a sequence
 #[derive(Deserialize, ToSchema)]
 pub struct SequenceStep {
-    /// ON duration in milliseconds
     #[schema(example = 200)]
     pub on_ms:  u64,
-    /// OFF duration in milliseconds (0 = no pause before next step)
     #[schema(example = 100)]
     pub off_ms: u64,
 }
@@ -158,7 +157,6 @@ pub struct SequenceStep {
 /// Sequence of on/off steps, executed once then channel goes off
 #[derive(Deserialize, ToSchema)]
 pub struct SequenceBody {
-    /// List of steps to execute in order
     pub steps: Vec<SequenceStep>,
 }
 
@@ -175,7 +173,6 @@ fn err(status: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<ApiOk>) 
     (status, Json(ApiOk { ok: false, message: Some(msg.into()) }))
 }
 
-/// Returns a 503 response when the tower light hardware is not connected.
 fn no_hw() -> (StatusCode, Json<ApiOk>) {
     err(
         StatusCode::SERVICE_UNAVAILABLE,
@@ -183,7 +180,6 @@ fn no_hw() -> (StatusCode, Json<ApiOk>) {
     )
 }
 
-/// Find the port for the tower light, respecting CLI override.
 fn resolve_port(s: &AppState) -> Option<String> {
     if let Some(ref path) = s.port_override {
         return Some(path.clone());
@@ -191,37 +187,31 @@ fn resolve_port(s: &AppState) -> Option<String> {
     crate::hardware::find_device_port(s.vid, s.pid)
 }
 
-/// Check if the tower light is present on USB by enumerating ports.
-/// Accurate even immediately after plug/unplug — no filesystem tricks needed.
 fn device_present(s: &AppState) -> bool {
-    let port = resolve_port(s);
-    tracing::info!("device_present: {:?}", port);
-    port.is_some()
+    // Try to actually open the port — the only reliable way to detect
+    // disconnection since available_ports() can lag behind hardware state.
+    let Some(port) = resolve_port(s) else { return false };
+    serialport::new(&port, 9600)
+        .timeout(std::time::Duration::from_millis(200))
+        .open()
+        .is_ok()
 }
 
-/// Ensure hardware is open and ready. If the hw slot is None, tries to find
-/// and open the device. If the device has been unplugged, clears the slot.
-/// Returns true if hardware is available after this call.
 async fn ensure_connected(s: &AppState) -> bool {
     let mut hw = s.hw.lock().await;
 
-    // If we have an open handle, verify the device is still on USB.
     if hw.is_some() {
-        if device_present(s) {
+        if resolve_port(s).is_some() {
             return true;
         }
-        // Device was unplugged — clear the handle.
         *hw = None;
         return false;
     }
 
-    // No handle — try to find and open the device.
-    let Some(port) = resolve_port(s) else {
-        return false;
-    };
+    let Some(port) = resolve_port(s) else { return false };
     match crate::hardware::TowerHardware::open(&port) {
         Ok(dev) => {
-            tracing::info!("Tower light connected on {port}");
+            info!("Tower light connected on {port}");
             *hw = Some(dev);
             true
         }
@@ -232,7 +222,7 @@ async fn ensure_connected(s: &AppState) -> bool {
 fn parse_channel(s: &str) -> Option<Channel> {
     match s.to_lowercase().as_str() {
         "red"    => Some(Channel::Red),
-        "yellow" => Some(Channel::Yellow),
+        "orange" => Some(Channel::Orange),
         "green"  => Some(Channel::Green),
         "buzzer" => Some(Channel::Buzzer),
         _        => None,
@@ -242,7 +232,7 @@ fn parse_channel(s: &str) -> Option<Channel> {
 fn hw_on_off_blink(ch: Channel) -> (u8, u8, u8) {
     match ch {
         Channel::Red    => (HW_RED_ON,    HW_RED_OFF,    HW_RED_BLINK),
-        Channel::Yellow => (HW_YELLOW_ON, HW_YELLOW_OFF, HW_YELLOW_BLINK),
+        Channel::Orange => (HW_ORANGE_ON, HW_ORANGE_OFF, HW_ORANGE_BLINK),
         Channel::Green  => (HW_GREEN_ON,  HW_GREEN_OFF,  HW_GREEN_BLINK),
         Channel::Buzzer => (HW_BUZZER_ON, HW_BUZZER_OFF, HW_BUZZER_BLINK),
     }
@@ -255,6 +245,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/status",            get(get_status))
         .route("/clear",             post(post_clear))
         .route("/set",               post(post_set_all))
+        .route("/yellow/on",         post(post_yellow_on))
+        .route("/yellow/off",        post(post_yellow_off))
         .route("/:channel/on",       post(post_on))
         .route("/:channel/off",      post(post_off))
         .route("/:channel",          delete(delete_channel))
@@ -283,16 +275,10 @@ pub fn build_router(state: AppState) -> Router {
     )
 )]
 async fn get_status(State(s): State<AppState>) -> impl IntoResponse {
-    // Enumerate USB ports to get a live, accurate connection status.
-    // This works immediately on plug/unplug without needing any I/O on the port.
     let connected = device_present(&s);
-
-    // If we have an open handle but the device is gone, clear it so the next
-    // control request will re-open cleanly.
     if !connected {
         *s.hw.lock().await = None;
     }
-
     let light = s.light.lock().await.clone();
     (StatusCode::OK, Json(StatusResponse { connected, light }))
 }
@@ -349,7 +335,7 @@ async fn post_set_all(
     }
     let channels: &[(Option<bool>, Channel)] = &[
         (body.red,    Channel::Red),
-        (body.yellow, Channel::Yellow),
+        (body.orange, Channel::Orange),
         (body.green,  Channel::Green),
         (body.buzzer, Channel::Buzzer),
     ];
@@ -369,12 +355,102 @@ async fn post_set_all(
     ok("Channels set")
 }
 
+// ── Virtual yellow channel ────────────────────────────────────────────────────
+
+/// Turn yellow on (red + orange + green simultaneously)
+#[utoipa::path(
+    post,
+    path = "/yellow/on",
+    tag = "yellow",
+    responses(
+        (status = 200, description = "Yellow on (red + orange + green)",    body = ApiOk),
+        (status = 500, description = "Hardware error",                      body = ApiOk),
+        (status = 503, description = "Tower light not connected",           body = ApiOk),
+    )
+)]
+async fn post_yellow_on(State(s): State<AppState>) -> impl IntoResponse {
+    if !ensure_connected(&s).await {
+        return no_hw();
+    }
+    // Cancel any per-channel blink tasks on the three physical channels.
+    s.blinker.cancel(Channel::Red).await;
+    s.blinker.cancel(Channel::Orange).await;
+    s.blinker.cancel(Channel::Green).await;
+
+    let mut hw = s.hw.lock().await;
+    for cmd in [HW_RED_ON, HW_ORANGE_ON, HW_GREEN_ON] {
+        if let Err(e) = hw.as_mut().unwrap().send(cmd) {
+            *hw = None;
+            return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+        }
+    }
+    drop(hw);
+
+    let mut l = s.light.lock().await;
+    // Set the physical channels directly without clearing yellow_active.
+    l.red    = ChannelState::On;
+    l.orange = ChannelState::On;
+    l.green  = ChannelState::On;
+    l.yellow = true;
+    l.last_updated = Some(chrono::Utc::now());
+    info!("YELLOW ON (red + orange + green)");
+    ok("yellow on")
+}
+
+/// Turn yellow off — only turns off red + orange + green if yellow mode was active
+#[utoipa::path(
+    post,
+    path = "/yellow/off",
+    tag = "yellow",
+    responses(
+        (status = 200, description = "Yellow off",                          body = ApiOk),
+        (status = 500, description = "Hardware error",                      body = ApiOk),
+        (status = 503, description = "Tower light not connected",           body = ApiOk),
+    )
+)]
+async fn post_yellow_off(State(s): State<AppState>) -> impl IntoResponse {
+    {
+        let l = s.light.lock().await;
+        if !l.yellow {
+            return ok("yellow was not active, nothing changed");
+        }
+    }
+
+    if !ensure_connected(&s).await {
+        return no_hw();
+    }
+
+    s.blinker.cancel(Channel::Red).await;
+    s.blinker.cancel(Channel::Orange).await;
+    s.blinker.cancel(Channel::Green).await;
+
+    let mut hw = s.hw.lock().await;
+    for cmd in [HW_RED_OFF, HW_ORANGE_OFF, HW_GREEN_OFF] {
+        if let Err(e) = hw.as_mut().unwrap().send(cmd) {
+            *hw = None;
+            return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+        }
+    }
+    drop(hw);
+
+    let mut l = s.light.lock().await;
+    l.red    = ChannelState::Off;
+    l.orange = ChannelState::Off;
+    l.green  = ChannelState::Off;
+    l.yellow = false;
+    l.last_updated = Some(chrono::Utc::now());
+    info!("YELLOW OFF");
+    ok("yellow off")
+}
+
+// ── Per-channel handlers ──────────────────────────────────────────────────────
+
 /// Turn a channel on
 #[utoipa::path(
     post,
     path = "/{channel}/on",
     tag = "channel",
-    params(("channel" = String, Path, description = "red | yellow | green | buzzer")),
+    params(("channel" = String, Path, description = "red | orange | green | buzzer")),
     responses(
         (status = 200, description = "Channel turned on",           body = ApiOk),
         (status = 404, description = "Unknown channel",             body = ApiOk),
@@ -398,7 +474,7 @@ async fn post_on(
     match hw.as_mut().unwrap().send(on_cmd) {
         Ok(_) => {
             let mut l = s.light.lock().await;
-            l.set_channel(ch, ChannelState::On);
+            l.set_channel(ch, ChannelState::On); // also clears yellow_active
             info!("{ch} ON");
             ok(format!("{ch} on"))
         }
@@ -414,7 +490,7 @@ async fn post_on(
     post,
     path = "/{channel}/off",
     tag = "channel",
-    params(("channel" = String, Path, description = "red | yellow | green | buzzer")),
+    params(("channel" = String, Path, description = "red | orange | green | buzzer")),
     responses(
         (status = 200, description = "Channel turned off",          body = ApiOk),
         (status = 404, description = "Unknown channel",             body = ApiOk),
@@ -434,7 +510,7 @@ async fn post_off(
     delete,
     path = "/{channel}",
     tag = "channel",
-    params(("channel" = String, Path, description = "red | yellow | green | buzzer")),
+    params(("channel" = String, Path, description = "red | orange | green | buzzer")),
     responses(
         (status = 200, description = "Channel turned off",          body = ApiOk),
         (status = 404, description = "Unknown channel",             body = ApiOk),
@@ -462,7 +538,7 @@ async fn channel_off(s: AppState, channel: String) -> impl IntoResponse {
     match hw.as_mut().unwrap().send(off_cmd) {
         Ok(_) => {
             let mut l = s.light.lock().await;
-            l.set_channel(ch, ChannelState::Off);
+            l.set_channel(ch, ChannelState::Off); // also clears yellow_active
             info!("{ch} OFF");
             ok(format!("{ch} off"))
         }
@@ -478,7 +554,7 @@ async fn channel_off(s: AppState, channel: String) -> impl IntoResponse {
     post,
     path = "/{channel}/blink/hw",
     tag = "channel",
-    params(("channel" = String, Path, description = "red | yellow | green | buzzer")),
+    params(("channel" = String, Path, description = "red | orange | green | buzzer")),
     responses(
         (status = 200, description = "Hardware blink started",      body = ApiOk),
         (status = 404, description = "Unknown channel",             body = ApiOk),
@@ -518,7 +594,7 @@ async fn post_hw_blink(
     post,
     path = "/{channel}/blink",
     tag = "advanced",
-    params(("channel" = String, Path, description = "red | yellow | green | buzzer")),
+    params(("channel" = String, Path, description = "red | orange | green | buzzer")),
     request_body = BlinkBody,
     responses(
         (status = 200, description = "Blink started",               body = ApiOk),
@@ -548,7 +624,7 @@ async fn post_sw_blink(
     post,
     path = "/{channel}/pulse",
     tag = "advanced",
-    params(("channel" = String, Path, description = "red | yellow | green | buzzer")),
+    params(("channel" = String, Path, description = "red | orange | green | buzzer")),
     request_body = PulseBody,
     responses(
         (status = 200, description = "Pulse started",               body = ApiOk),
@@ -578,7 +654,7 @@ async fn post_pulse(
     post,
     path = "/{channel}/timed",
     tag = "advanced",
-    params(("channel" = String, Path, description = "red | yellow | green | buzzer")),
+    params(("channel" = String, Path, description = "red | orange | green | buzzer")),
     request_body = TimedBody,
     responses(
         (status = 200, description = "Timed on started",            body = ApiOk),
@@ -603,12 +679,12 @@ async fn post_timed(
     ok(format!("{ch} on for {}ms", body.duration_ms))
 }
 
-/// Execute a custom step pattern once then turn off. Useful for morse code, boot animations, alerts.
+/// Execute a custom step pattern once then turn off.
 #[utoipa::path(
     post,
     path = "/{channel}/sequence",
     tag = "advanced",
-    params(("channel" = String, Path, description = "red | yellow | green | buzzer")),
+    params(("channel" = String, Path, description = "red | orange | green | buzzer")),
     request_body = SequenceBody,
     responses(
         (status = 200, description = "Sequence started",            body = ApiOk),

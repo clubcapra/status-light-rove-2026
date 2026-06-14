@@ -39,9 +39,12 @@ impl ChannelState {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct LightState {
     pub red:          ChannelState,
-    pub yellow:       ChannelState,
+    /// The physical orange LED segment (labelled "yellow" on the hardware).
+    pub orange:       ChannelState,
     pub green:        ChannelState,
     pub buzzer:       ChannelState,
+    /// True when the virtual yellow mode is active (red + orange + green all on).
+    pub yellow:       bool,
     pub last_updated: Option<DateTime<Utc>>,
 }
 
@@ -54,9 +57,12 @@ impl LightState {
     }
 
     pub fn set_channel(&mut self, ch: Channel, state: ChannelState) {
+        // Any manual channel change clears yellow mode since the user is now
+        // controlling channels independently.
+        self.yellow = false;
         match ch {
             Channel::Red    => self.red    = state,
-            Channel::Yellow => self.yellow = state,
+            Channel::Orange => self.orange = state,
             Channel::Green  => self.green  = state,
             Channel::Buzzer => self.buzzer = state,
         }
@@ -66,7 +72,7 @@ impl LightState {
     pub fn get_channel(&self, ch: Channel) -> &ChannelState {
         match ch {
             Channel::Red    => &self.red,
-            Channel::Yellow => &self.yellow,
+            Channel::Orange => &self.orange,
             Channel::Green  => &self.green,
             Channel::Buzzer => &self.buzzer,
         }
@@ -79,14 +85,15 @@ impl LightState {
 #[serde(rename_all = "snake_case")]
 pub enum Channel {
     Red,
-    Yellow,
+    /// The physical orange LED segment (the middle one on the tower).
+    Orange,
     Green,
     Buzzer,
 }
 
 impl Channel {
     pub fn all() -> [Channel; 4] {
-        [Channel::Red, Channel::Yellow, Channel::Green, Channel::Buzzer]
+        [Channel::Red, Channel::Orange, Channel::Green, Channel::Buzzer]
     }
 }
 
@@ -94,7 +101,7 @@ impl std::fmt::Display for Channel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Channel::Red    => write!(f, "red"),
-            Channel::Yellow => write!(f, "yellow"),
+            Channel::Orange => write!(f, "orange"),
             Channel::Green  => write!(f, "green"),
             Channel::Buzzer => write!(f, "buzzer"),
         }

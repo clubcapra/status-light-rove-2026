@@ -8,7 +8,7 @@ use tracing::{debug, warn};
 use crate::hardware::{
     TowerHardware,
     HW_RED_ON,    HW_RED_OFF,
-    HW_YELLOW_ON, HW_YELLOW_OFF,
+    HW_ORANGE_ON, HW_ORANGE_OFF,
     HW_GREEN_ON,  HW_GREEN_OFF,
     HW_BUZZER_ON, HW_BUZZER_OFF,
 };
@@ -28,13 +28,6 @@ impl Drop for ChannelTask {
 
 // ── BlinkEngine ───────────────────────────────────────────────────────────────
 
-/// Manages software-driven blink tasks for each channel independently.
-/// Each channel gets at most one running task at a time; starting a new one
-/// automatically cancels the previous.
-///
-/// When hardware is `None` the engine still tracks state but silently skips
-/// all serial writes — the routes layer is responsible for rejecting requests
-/// before they reach the engine.
 pub struct BlinkEngine {
     hw:    Arc<Mutex<Option<TowerHardware>>>,
     light: Arc<Mutex<LightState>>,
@@ -44,7 +37,7 @@ pub struct BlinkEngine {
 fn channel_index(ch: Channel) -> usize {
     match ch {
         Channel::Red    => 0,
-        Channel::Yellow => 1,
+        Channel::Orange => 1,
         Channel::Green  => 2,
         Channel::Buzzer => 3,
     }
@@ -53,13 +46,12 @@ fn channel_index(ch: Channel) -> usize {
 fn hw_on_off(ch: Channel) -> (u8, u8) {
     match ch {
         Channel::Red    => (HW_RED_ON,    HW_RED_OFF),
-        Channel::Yellow => (HW_YELLOW_ON, HW_YELLOW_OFF),
+        Channel::Orange => (HW_ORANGE_ON, HW_ORANGE_OFF),
         Channel::Green  => (HW_GREEN_ON,  HW_GREEN_OFF),
         Channel::Buzzer => (HW_BUZZER_ON, HW_BUZZER_OFF),
     }
 }
 
-/// Send a command to hardware if it is present, silently skip if not.
 async fn try_send(hw: &Arc<Mutex<Option<TowerHardware>>>, cmd: u8) {
     let mut lock = hw.lock().await;
     if let Some(ref mut dev) = *lock {
@@ -78,13 +70,11 @@ impl BlinkEngine {
         }
     }
 
-    /// Cancel any running blink task for a channel (called before simple on/off).
     pub async fn cancel(&self, ch: Channel) {
         let mut tasks = self.tasks.lock().await;
-        tasks[channel_index(ch)] = None; // Drop → abort
+        tasks[channel_index(ch)] = None;
     }
 
-    /// Cancel all channel tasks.
     pub async fn cancel_all(&self) {
         let mut tasks = self.tasks.lock().await;
         for t in tasks.iter_mut() {
@@ -92,7 +82,6 @@ impl BlinkEngine {
         }
     }
 
-    /// Software blink: toggle at on_ms / off_ms forever.
     pub async fn start_sw_blink(&self, ch: Channel, on_ms: u64, off_ms: u64) {
         let hw    = Arc::clone(&self.hw);
         let light = Arc::clone(&self.light);
@@ -114,7 +103,6 @@ impl BlinkEngine {
         l.set_channel(ch, ChannelState::SwBlink { on_ms, off_ms });
     }
 
-    /// Pulse: blink exactly `count` times then turn off.
     pub async fn start_pulse(&self, ch: Channel, on_ms: u64, off_ms: u64, count: u32) {
         let hw          = Arc::clone(&self.hw);
         let light       = Arc::clone(&self.light);
@@ -142,7 +130,6 @@ impl BlinkEngine {
         l.set_channel(ch, ChannelState::Pulse { on_ms, off_ms, remaining: count });
     }
 
-    /// Timed on: turn a channel on for `duration_ms` then off automatically.
     pub async fn start_timed(&self, ch: Channel, duration_ms: u64) {
         let hw          = Arc::clone(&self.hw);
         let light       = Arc::clone(&self.light);
@@ -164,8 +151,6 @@ impl BlinkEngine {
         l.set_channel(ch, ChannelState::On);
     }
 
-    /// Execute a sequence of steps on a single channel.
-    /// Each step is (on_ms, off_ms); runs once then channel goes off.
     pub async fn start_sequence(&self, ch: Channel, steps: Vec<(u64, u64)>) {
         let hw          = Arc::clone(&self.hw);
         let light       = Arc::clone(&self.light);

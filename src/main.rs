@@ -32,10 +32,6 @@ pub struct AppState {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-
-    for p in serialport::available_ports().unwrap_or_default() {
-        eprintln!("{:?}", p);
-    }
     tracing_subscriber::fmt()
         .with_env_filter(
             std::env::var("RUST_LOG")
@@ -111,7 +107,7 @@ async fn main() -> Result<()> {
 
     let bind = std::env::var("TOWER_BIND").unwrap_or_else(|_| "0.0.0.0:3000".into());
     info!("Tower light API listening on http://{}", bind);
-    eprintln!("✔ Tower light API ready → http://{}/docs/", bind);
+    eprintln!("✔ Tower light API ready → http://{}", bind);
 
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     axum::serve(listener, router).await?;
