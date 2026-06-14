@@ -43,7 +43,8 @@ pub struct LightState {
     pub orange:       ChannelState,
     pub green:        ChannelState,
     pub buzzer:       ChannelState,
-    /// True when the virtual yellow mode is active (red + orange + green all on).
+    /// True when the virtual yellow mode is active (red + orange + green
+    /// were turned on together). Cleared by any manual per-channel change.
     pub yellow:       bool,
     pub last_updated: Option<DateTime<Utc>>,
 }
@@ -56,34 +57,44 @@ impl LightState {
         };
     }
 
-    pub fn set_channel(&mut self, ch: Channel, state: ChannelState) {
-        // Any manual channel change clears yellow mode since the user is now
-        // controlling channels independently.
+    /// Set a physical channel state and clear yellow mode, since the user is
+    /// now controlling channels independently.
+    pub fn set_channel(&mut self, ch: PhysicalChannel, state: ChannelState) {
         self.yellow = false;
         match ch {
-            Channel::Red    => self.red    = state,
-            Channel::Orange => self.orange = state,
-            Channel::Green  => self.green  = state,
-            Channel::Buzzer => self.buzzer = state,
+            PhysicalChannel::Red    => self.red    = state,
+            PhysicalChannel::Orange => self.orange = state,
+            PhysicalChannel::Green  => self.green  = state,
+            PhysicalChannel::Buzzer => self.buzzer = state,
         }
         self.last_updated = Some(Utc::now());
     }
 
-    pub fn get_channel(&self, ch: Channel) -> &ChannelState {
+    /// Set yellow mode state across all three physical channels.
+    pub fn set_yellow(&mut self, state: ChannelState, active: bool) {
+        self.yellow = active;
+        self.red    = state.clone();
+        self.orange = state.clone();
+        self.green  = state;
+        self.last_updated = Some(Utc::now());
+    }
+
+    pub fn get_channel(&self, ch: PhysicalChannel) -> &ChannelState {
         match ch {
-            Channel::Red    => &self.red,
-            Channel::Orange => &self.orange,
-            Channel::Green  => &self.green,
-            Channel::Buzzer => &self.buzzer,
+            PhysicalChannel::Red    => &self.red,
+            PhysicalChannel::Orange => &self.orange,
+            PhysicalChannel::Green  => &self.green,
+            PhysicalChannel::Buzzer => &self.buzzer,
         }
     }
 }
 
-// ── Channel enum ──────────────────────────────────────────────────────────────
+// ── Channel enums ─────────────────────────────────────────────────────────────
 
+/// The four physical hardware channels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum Channel {
+pub enum PhysicalChannel {
     Red,
     /// The physical orange LED segment (the middle one on the tower).
     Orange,
@@ -91,19 +102,41 @@ pub enum Channel {
     Buzzer,
 }
 
-impl Channel {
-    pub fn all() -> [Channel; 4] {
-        [Channel::Red, Channel::Orange, Channel::Green, Channel::Buzzer]
+impl PhysicalChannel {
+    pub fn all() -> [PhysicalChannel; 4] {
+        [PhysicalChannel::Red, PhysicalChannel::Orange, PhysicalChannel::Green, PhysicalChannel::Buzzer]
     }
 }
 
-impl std::fmt::Display for Channel {
+impl std::fmt::Display for PhysicalChannel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Channel::Red    => write!(f, "red"),
-            Channel::Orange => write!(f, "orange"),
-            Channel::Green  => write!(f, "green"),
-            Channel::Buzzer => write!(f, "buzzer"),
+            PhysicalChannel::Red    => write!(f, "red"),
+            PhysicalChannel::Orange => write!(f, "orange"),
+            PhysicalChannel::Green  => write!(f, "green"),
+            PhysicalChannel::Buzzer => write!(f, "buzzer"),
         }
     }
 }
+
+/// A parsed channel from a route — either a physical channel or the virtual yellow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteChannel {
+    Physical(PhysicalChannel),
+    Yellow,
+}
+
+/// Parse a channel name from a route path segment.
+pub fn parse_route_channel(s: &str) -> Option<RouteChannel> {
+    match s.to_lowercase().as_str() {
+        "red"    => Some(RouteChannel::Physical(PhysicalChannel::Red)),
+        "orange" => Some(RouteChannel::Physical(PhysicalChannel::Orange)),
+        "green"  => Some(RouteChannel::Physical(PhysicalChannel::Green)),
+        "buzzer" => Some(RouteChannel::Physical(PhysicalChannel::Buzzer)),
+        "yellow" => Some(RouteChannel::Yellow),
+        _        => None,
+    }
+}
+
+// Keep Channel as a type alias for backwards compat with blink_engine
+pub type Channel = PhysicalChannel;
