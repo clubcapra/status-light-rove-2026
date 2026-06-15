@@ -2,6 +2,7 @@ mod hardware;
 mod state;
 mod routes;
 mod blink_engine;
+mod reconnect;
 
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -102,6 +103,10 @@ async fn main() -> Result<()> {
         pid: TOWER_PID,
         port_override,
     };
+
+    // Keep the physical LEDs in sync with the logical state across USB
+    // unplug/replug, even when no requests are arriving.
+    tokio::spawn(reconnect::run_reconnect_monitor(app_state.clone()));
 
     let router = routes::build_router(app_state);
 

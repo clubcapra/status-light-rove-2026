@@ -1,7 +1,6 @@
 use std::time::Duration;
 use anyhow::{Context, Result};
 use serialport::SerialPort;
-use tracing::{info, warn, error};
 
 // ── Hardware byte constants ───────────────────────────────────────────────────
 
@@ -62,15 +61,15 @@ impl TowerHardware {
     }
 
     /// Send a single command byte to the hardware.
-    /// On failure, attempt one reconnect then retry.
-    /// Returns Err if the device is truly gone after the reconnect attempt.
+    ///
+    /// On a write failure the error is returned and the caller is expected to
+    /// drop this handle (set the shared `Option<TowerHardware>` to `None`). The
+    /// reconnect monitor then reopens the port and replays the logical state, so
+    /// reconnection and state restoration are handled in exactly one place
+    /// instead of being retried piecemeal here.
     pub fn send(&mut self, cmd: u8) -> Result<()> {
-        if let Err(e) = self.port.write_all(&[cmd]) {
-            warn!("Serial write failed ({e}), attempting reconnect...");
-            self.reconnect()?;
-            self.port.write_all(&[cmd])
-                .context("Write failed after reconnect")?;
-        }
+        self.port.write_all(&[cmd])
+            .with_context(|| format!("Serial write failed on {}", self.port_path))?;
         Ok(())
     }
 
@@ -80,24 +79,5 @@ impl TowerHardware {
             self.send(cmd)?;
         }
         Ok(())
-    }
-
-    /// Attempt to reopen the serial port (called after a write error).
-    fn reconnect(&mut self) -> Result<()> {
-        std::thread::sleep(Duration::from_millis(500));
-        match serialport::new(&self.port_path, 9600)
-            .timeout(Duration::from_millis(200))
-            .open()
-        {
-            Ok(p) => {
-                self.port = p;
-                info!("Reconnected to {}", self.port_path);
-                Ok(())
-            }
-            Err(e) => {
-                error!("Reconnect failed: {e}");
-                Err(anyhow::anyhow!(e))
-            }
-        }
     }
 }

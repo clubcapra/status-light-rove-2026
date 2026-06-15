@@ -11,10 +11,9 @@ use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
 use crate::hardware::{
-    HW_RED_ON,    HW_RED_OFF,    HW_RED_BLINK,
-    HW_ORANGE_ON, HW_ORANGE_OFF, HW_ORANGE_BLINK,
-    HW_GREEN_ON,  HW_GREEN_OFF,  HW_GREEN_BLINK,
-    HW_BUZZER_ON, HW_BUZZER_OFF, HW_BUZZER_BLINK,
+    HW_RED_ON,    HW_RED_OFF,
+    HW_ORANGE_ON, HW_ORANGE_OFF,
+    HW_GREEN_ON,  HW_GREEN_OFF,
 };
 use crate::state::{PhysicalChannel, ChannelState, LightState, RouteChannel, parse_route_channel};
 use crate::AppState;
@@ -160,7 +159,7 @@ fn no_hw() -> (StatusCode, Json<ApiOk>) {
     err(StatusCode::SERVICE_UNAVAILABLE, "Tower light not connected — device not found on USB")
 }
 
-fn resolve_port(s: &AppState) -> Option<String> {
+pub(crate) fn resolve_port(s: &AppState) -> Option<String> {
     if let Some(ref path) = s.port_override {
         return Some(path.clone());
     }
@@ -186,8 +185,14 @@ async fn ensure_connected(s: &AppState) -> bool {
     }
     let Some(port) = resolve_port(s) else { return false };
     match crate::hardware::TowerHardware::open(&port) {
-        Ok(dev) => {
-            info!("Tower light connected on {port}");
+        Ok(mut dev) => {
+            // Replay the logical state so the physical LEDs match what the API
+            // believes is showing, then publish the handle.
+            {
+                let light = s.light.lock().await;
+                crate::reconnect::restore_light_state(&light, &mut dev);
+            }
+            info!("Tower light connected on {port}; state restored");
             *hw = Some(dev);
             true
         }
@@ -196,12 +201,7 @@ async fn ensure_connected(s: &AppState) -> bool {
 }
 
 fn hw_on_off_blink(ch: PhysicalChannel) -> (u8, u8, u8) {
-    match ch {
-        PhysicalChannel::Red    => (HW_RED_ON,    HW_RED_OFF,    HW_RED_BLINK),
-        PhysicalChannel::Orange => (HW_ORANGE_ON, HW_ORANGE_OFF, HW_ORANGE_BLINK),
-        PhysicalChannel::Green  => (HW_GREEN_ON,  HW_GREEN_OFF,  HW_GREEN_BLINK),
-        PhysicalChannel::Buzzer => (HW_BUZZER_ON, HW_BUZZER_OFF, HW_BUZZER_BLINK),
-    }
+    ch.hw_commands()
 }
 
 // ── Router ────────────────────────────────────────────────────────────────────
