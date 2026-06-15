@@ -82,11 +82,16 @@ async fn main() -> Result<()> {
                 error!("Boot all_off failed: {e}");
             }
             light_lock.clear();
-            if let Err(e) = hw_dev.send(hardware::HW_GREEN_ON) {
-                error!("Boot green_on failed: {e}");
+            for cmd in [hardware::HW_RED_ON, hardware::HW_ORANGE_ON, hardware::HW_GREEN_ON] {
+                if let Err(e) = hw_dev.send(cmd) {
+                    error!("Boot yellow_on failed: {e}");
+                }
             }
-            light_lock.green = state::ChannelState::On;
-            info!("Boot state: GREEN ON");
+            light_lock.red    = state::ChannelState::On;
+            light_lock.orange = state::ChannelState::On;
+            light_lock.green  = state::ChannelState::On;
+            light_lock.yellow = true;
+            info!("Boot state: YELLOW ON (red + orange + green)");
         } else {
             info!("Boot state: no hardware, skipping boot sequence");
         }
