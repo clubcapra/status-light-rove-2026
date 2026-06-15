@@ -57,9 +57,13 @@ fn hw_on_off(ch: PhysicalChannel) -> (u8, u8) {
 
 async fn try_send(hw: &Arc<Mutex<Option<TowerHardware>>>, cmd: u8) {
     let mut lock = hw.lock().await;
-    if let Some(ref mut dev) = *lock {
+    if let Some(dev) = lock.as_mut() {
         if let Err(e) = dev.send(cmd) {
-            warn!("blink engine hw error: {e}");
+            // Drop the dead handle so the reconnect monitor reopens it and
+            // replays state; this blink task keeps looping and resumes sending
+            // once the handle is published again.
+            warn!("blink engine hw error: {e}; dropping connection for reconnect");
+            *lock = None;
         }
     }
 }

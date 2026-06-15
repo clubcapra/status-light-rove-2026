@@ -2,6 +2,13 @@ use serde::{Deserialize, Serialize};
 use chrono::{DateTime, Utc};
 use utoipa::ToSchema;
 
+use crate::hardware::{
+    HW_RED_ON,    HW_RED_OFF,    HW_RED_BLINK,
+    HW_ORANGE_ON, HW_ORANGE_OFF, HW_ORANGE_BLINK,
+    HW_GREEN_ON,  HW_GREEN_OFF,  HW_GREEN_BLINK,
+    HW_BUZZER_ON, HW_BUZZER_OFF, HW_BUZZER_BLINK,
+};
+
 // ── Per-channel state ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default, ToSchema)]
@@ -105,6 +112,16 @@ pub enum PhysicalChannel {
 impl PhysicalChannel {
     pub fn all() -> [PhysicalChannel; 4] {
         [PhysicalChannel::Red, PhysicalChannel::Orange, PhysicalChannel::Green, PhysicalChannel::Buzzer]
+    }
+
+    /// The `(on, off, blink)` hardware command bytes for this channel.
+    pub fn hw_commands(self) -> (u8, u8, u8) {
+        match self {
+            PhysicalChannel::Red    => (HW_RED_ON,    HW_RED_OFF,    HW_RED_BLINK),
+            PhysicalChannel::Orange => (HW_ORANGE_ON, HW_ORANGE_OFF, HW_ORANGE_BLINK),
+            PhysicalChannel::Green  => (HW_GREEN_ON,  HW_GREEN_OFF,  HW_GREEN_BLINK),
+            PhysicalChannel::Buzzer => (HW_BUZZER_ON, HW_BUZZER_OFF, HW_BUZZER_BLINK),
+        }
     }
 }
 
